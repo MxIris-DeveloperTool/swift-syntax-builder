@@ -90,8 +90,9 @@ fastlane/test_output
 
 iOSInjectionProject/
 /Sources
-/601.0.1
+/[0-9]*
 /.claude
 /.DS_Store
 .swiftpm
 /Package.swift
+/__pycache__

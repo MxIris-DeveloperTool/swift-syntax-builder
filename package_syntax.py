@@ -4,21 +4,32 @@ DIY rebuild of all binary framework zip files from Apple source.
 Generates Package.swift with _Aggregation target pattern.
 
 Usage:
-    python3 package_syntax_v3.py [OPTIONS]
+    python3 package_syntax.py [OPTIONS]
 
 Options:
     --repo URL          Repository URL (default: https://github.com/apple/swift-syntax)
     --tag VERSION       Tag/version to build (default: 601.0.1)
-    --platforms LIST    Platforms to build, comma-separated (default: macOS)
-                        Examples: "macOS" "macOS,iOS" "macOS,iOS,iOS_Simulator"
+    --platforms LIST    Platforms to build, comma-separated (default: macOS).
+                        Valid names: macOS, iOS, iOS_Simulator, tvOS, tvOS_Simulator,
+                        watchOS, watchOS_Simulator, visionOS, visionOS_Simulator.
+    --all-platforms     Build for every supported platform (overrides --platforms).
     --mode MODE         "local" for local paths, "remote" for URLs (default: local)
-    --base-url URL      Base URL for remote xcframeworks (required if mode=remote)
+    --base-url URL      Base URL for remote xcframeworks (required if mode=remote
+                        and --publish is not set)
     --output FILE       Output Package.swift path (default: ./Package.swift)
+    --publish           Upload built zips to a GitHub Release (requires `gh` CLI)
+    --release-repo R    Target repo for --publish in OWNER/REPO form
+                        (default: detect from current git origin)
+    --release-title T   Release title for --publish (default: tag)
+    --release-notes N   Release notes body for --publish
     --help              Show this help message
 
 Examples:
-    python3 package_syntax_v3.py --tag 601.0.1 --platforms macOS
-    python3 package_syntax_v3.py --tag 601.0.1 --mode remote --base-url "https://example.com/frameworks"
+    python3 package_syntax.py --tag 601.0.1 --platforms macOS
+    python3 package_syntax.py --tag 603.0.1 --all-platforms
+    python3 package_syntax.py --tag 603.0.1 --mode remote --base-url "https://example.com/frameworks"
+    python3 package_syntax.py --tag 603.0.1 --all-platforms --publish --mode remote \\
+        --release-repo Mx-Iris/swift-syntax-binaries
 """
 
 import argparse
@@ -29,16 +40,23 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
 class SwiftSyntaxBuilder:
     """Builder for swift-syntax binary frameworks."""
 
-    # Modules to exclude from build
-    EXCLUDED_TARGETS: Set[str] = {'_InstructionCounter', '_SwiftSyntaxTestSupport'}
+    # Modules to exclude from build. `SwiftSyntax-all` is swift-syntax's meta
+    # umbrella target that depends on every non-test target — it exists only
+    # for `swift build`/CI purposes and shouldn't be shipped as a product.
+    EXCLUDED_TARGETS: Set[str] = {
+        '_InstructionCounter',
+        '_SwiftSyntaxTestSupport',
+        'SwiftSyntax-all',
+    }
 
-    # Public products matching swift-syntax's public API
+    # Public products matching swift-syntax's public API.
+    # Products that don't exist in the selected tag are filtered out at generation time.
     PUBLIC_PRODUCTS: List[str] = [
         "SwiftBasicFormat",
         "SwiftCompilerPlugin",
@@ -56,6 +74,7 @@ class SwiftSyntaxBuilder:
         "SwiftSyntaxMacroExpansion",
         "SwiftSyntaxMacrosTestSupport",
         "SwiftSyntaxMacrosGenericTestSupport",
+        "SwiftWarningControl",
     ]
 
     # Products with different public name vs internal target name
@@ -63,6 +82,23 @@ class SwiftSyntaxBuilder:
         "_SwiftCompilerPluginMessageHandling": "SwiftCompilerPluginMessageHandling",
         "_SwiftLibraryPluginProvider": "SwiftLibraryPluginProvider",
     }
+
+    # Mapping: platform name -> (derived-data dir name, Products subdirectory).
+    # Platform names use underscores so they can be passed to xcodebuild via
+    # `platform.replace('_', ' ')` (e.g. "iOS_Simulator" -> "iOS Simulator").
+    PLATFORM_BUILD_DIRS: Dict[str, Tuple[str, str]] = {
+        "macOS": ("build.macOS", "Release"),
+        "iOS": ("build.iOS", "Release-iphoneos"),
+        "iOS_Simulator": ("build.iOS_Simulator", "Release-iphonesimulator"),
+        "tvOS": ("build.tvOS", "Release-appletvos"),
+        "tvOS_Simulator": ("build.tvOS_Simulator", "Release-appletvsimulator"),
+        "watchOS": ("build.watchOS", "Release-watchos"),
+        "watchOS_Simulator": ("build.watchOS_Simulator", "Release-watchsimulator"),
+        "visionOS": ("build.visionOS", "Release-xros"),
+        "visionOS_Simulator": ("build.visionOS_Simulator", "Release-xrsimulator"),
+    }
+
+    ALL_PLATFORMS: List[str] = list(PLATFORM_BUILD_DIRS.keys())
 
     def __init__(
         self,
@@ -75,6 +111,10 @@ class SwiftSyntaxBuilder:
         parallel_builds: int = 4,
         config: str = "Release",
         conditions: str = "RESILIENT_LIBRARIES",
+        publish: bool = False,
+        release_repo: Optional[str] = None,
+        release_title: Optional[str] = None,
+        release_notes: Optional[str] = None,
     ):
         self.repo = repo
         self.repo_name = os.path.basename(repo)
@@ -86,6 +126,10 @@ class SwiftSyntaxBuilder:
         self.parallel_builds = parallel_builds
         self.config = config
         self.conditions = conditions
+        self.publish = publish
+        self.release_repo = release_repo
+        self.release_title = release_title
+        self.release_notes = release_notes
 
         self.dest = Path.cwd() / tag
         self.source = Path("/tmp") / self.repo_name
@@ -130,40 +174,49 @@ class SwiftSyntaxBuilder:
         self._run_command(["git", "checkout", self.tag])
 
     def patch_package_swift(self):
-        """Patch Package.swift to expose additional internal targets as library products."""
+        """Patch Package.swift to expose every non-test internal target as a library.
+
+        The set of exposed targets is computed dynamically: any `.target` /
+        `.macro` / `.executableTarget` whose name is not already used as a
+        library name (and isn't excluded) gets a same-name library appended.
+        Idempotent: re-runs add only the libraries still missing.
+        """
         package_file = self.source / "Package.swift"
         content = package_file.read_text()
 
-        # Check if already patched
-        if '_SwiftLibraryPluginProviderCShims' in content and '.library(name: "_SwiftLibraryPluginProviderCShims"' in content:
-            print("Package.swift already patched, skipping...")
+        existing_lib_names = set(re.findall(r'\.library\(\s*name:\s*"([^"]+)"', content))
+
+        # `\.target\(` does not match `.testTarget(` (different spelling), so
+        # we don't need a special exclusion for test targets.
+        target_re = re.compile(r'\.(?:target|macro|executableTarget)\(\s*name:\s*"([^"]+)"')
+        all_targets = set(target_re.findall(content))
+
+        targets_to_expose = sorted(
+            target
+            for target in all_targets
+            if target not in self.EXCLUDED_TARGETS
+            and target not in existing_lib_names
+        )
+
+        if not targets_to_expose:
+            print("Package.swift already exposes all needed libraries, skipping patch...")
             return
 
-        # Find the line to insert after
+        # `_SwiftLibraryPluginProvider` is a stable anchor across 5xx-6xx releases.
         insert_after = '.library(name: "_SwiftLibraryPluginProvider", targets:'
-
-        additional_products = '''
-    .library(name: "_SwiftLibraryPluginProviderCShims", targets: ["_SwiftLibraryPluginProviderCShims"]),
-    .library(name: "_SwiftSyntaxCShims", targets: ["_SwiftSyntaxCShims"]),
-    .library(name: "_SwiftSyntaxGenericTestSupport", targets: ["_SwiftSyntaxGenericTestSupport"]),
-    .library(name: "SwiftCompilerPluginMessageHandling", targets: ["SwiftCompilerPluginMessageHandling"]),
-    .library(name: "SwiftLibraryPluginProvider", targets: ["SwiftLibraryPluginProvider"]),
-    .library(name: "SwiftSyntax509", targets: ["SwiftSyntax509"]),
-    .library(name: "SwiftSyntax510", targets: ["SwiftSyntax510"]),
-    .library(name: "SwiftSyntax600", targets: ["SwiftSyntax600"]),
-    .library(name: "SwiftSyntax601", targets: ["SwiftSyntax601"]),'''
-
-        # Find the position and insert
         pos = content.find(insert_after)
         if pos == -1:
             raise ValueError(f"Could not find '{insert_after}' in Package.swift")
 
-        # Find the end of that line
         end_of_line = content.find('\n', pos)
 
-        new_content = content[:end_of_line + 1] + additional_products + content[end_of_line + 1:]
+        additions = '\n'.join(
+            f'    .library(name: "{name}", targets: ["{name}"]),'
+            for name in targets_to_expose
+        ) + '\n'
+        new_content = content[:end_of_line + 1] + additions + content[end_of_line + 1:]
         package_file.write_text(new_content)
-        print("Patched Package.swift")
+        print(f"Patched Package.swift, exposed {len(targets_to_expose)} libraries: {targets_to_expose}")
 
     def extract_modules(self):
         """Extract module names from patched Package.swift."""
@@ -329,6 +382,23 @@ class SwiftSyntaxBuilder:
         # Create zip
         self._create_zip(module, xcframework_path)
 
+    @staticmethod
+    def _variant_to_platform(variant_name: str) -> Optional[str]:
+        """Map an xcframework variant directory name (e.g. ios-arm64-simulator)
+        back to the internal platform name used by PLATFORM_BUILD_DIRS."""
+        is_simulator = "simulator" in variant_name
+        prefix_map = {
+            "macos-": "macOS",
+            "ios-": "iOS_Simulator" if is_simulator else "iOS",
+            "tvos-": "tvOS_Simulator" if is_simulator else "tvOS",
+            "watchos-": "watchOS_Simulator" if is_simulator else "watchOS",
+            "xros-": "visionOS_Simulator" if is_simulator else "visionOS",
+        }
+        for prefix, platform in prefix_map.items():
+            if variant_name.startswith(prefix):
+                return platform
+        return None
+
     def _copy_swift_modules(self, module: str, xcframework_path: Path):
         """Copy swift modules to xcframework."""
         if not xcframework_path.exists():
@@ -338,18 +408,13 @@ class SwiftSyntaxBuilder:
             if variant.name == "Info.plist" or not variant.is_dir():
                 continue
 
-            if variant.name.startswith("macos-"):
-                products_dir = self.source / "build.macOS" / "Build" / "Products" / "Release"
-            elif variant.name == "ios-arm64":
-                products_dir = self.source / "build.iOS" / "Build" / "Products" / "Release-iphoneos"
-            elif "simulator" in variant.name and variant.name.startswith("ios-"):
-                products_dir = self.source / "build.iOS_Simulator" / "Build" / "Products" / "Release-iphonesimulator"
-            elif "simulator" in variant.name and variant.name.startswith("tvos-"):
-                products_dir = self.source / "build.tvOS_Simulator" / "Build" / "Products" / "Release-appletvsimulator"
-            else:
+            platform = self._variant_to_platform(variant.name)
+            if platform is None:
                 continue
 
-            # Try to copy swift module
+            build_dir, products_subdir = self.PLATFORM_BUILD_DIRS[platform]
+            products_dir = self.source / build_dir / "Build" / "Products" / products_subdir
+
             swift_module = products_dir / f"{module}.swiftmodule"
             if swift_module.exists():
                 dest = variant / f"{module}.swiftmodule"
@@ -484,12 +549,21 @@ class SwiftSyntaxBuilder:
             "    products: [",
         ]
 
-        # Public products
+        # Public products — skip ones not present in the selected tag
+        # (e.g. SwiftWarningControl only exists from 603.0.1 onward).
+        modules_set = set(self.modules)
         for product in self.PUBLIC_PRODUCTS:
+            if product not in modules_set:
+                print(f"  Skipping product {product}: not present in tag {self.tag}")
+                continue
             lines.append(f'        .library(name: "{product}", targets: ["{product}_Aggregation"]),')
 
-        # Aliased products
+        # Aliased products — public name maps to an internal target name; the
+        # underlying target must exist as a built module.
         for public_name, target_name in self.ALIASED_PRODUCTS.items():
+            if target_name not in modules_set:
+                print(f"  Skipping aliased product {public_name}: target {target_name} not present in tag {self.tag}")
+                continue
             lines.append(f'        .library(name: "{public_name}", targets: ["{target_name}_Aggregation"]),')
 
         lines.append("    ],")
@@ -535,12 +609,64 @@ class SwiftSyntaxBuilder:
         self.output_file.write_text('\n'.join(lines))
         print(f"Generated: {self.output_file}")
 
+    def publish_release(self):
+        """Upload built xcframework zips to a GitHub Release via `gh`.
+
+        Creates the release at self.tag if missing; otherwise uploads with
+        --clobber to overwrite existing assets.
+        """
+        if not self.publish:
+            return
+        if not self.release_repo:
+            raise RuntimeError("publish_release called without release_repo set")
+
+        # Verify gh is installed and authenticated before uploading.
+        try:
+            subprocess.run(["gh", "auth", "status"], check=True, capture_output=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError("--publish requires the GitHub CLI (`gh`) to be installed") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError("`gh auth status` failed; run `gh auth login` first") from exc
+
+        zips = sorted(self.dest.glob("*.xcframework.zip"))
+        if not zips:
+            print(f"  Warning: no xcframework zips found in {self.dest}, skipping publish")
+            return
+
+        print(f"\nPublishing release {self.tag} to {self.release_repo} ({len(zips)} assets)...")
+
+        view = subprocess.run(
+            ["gh", "release", "view", self.tag, "--repo", self.release_repo],
+            capture_output=True
+        )
+        zip_paths = [str(z) for z in zips]
+
+        if view.returncode == 0:
+            print(f"  Release {self.tag} exists, uploading assets with --clobber")
+            cmd = [
+                "gh", "release", "upload", self.tag,
+                "--repo", self.release_repo, "--clobber",
+            ] + zip_paths
+        else:
+            print(f"  Creating release {self.tag}")
+            cmd = [
+                "gh", "release", "create", self.tag,
+                "--repo", self.release_repo,
+                "--title", self.release_title or self.tag,
+                "--notes", self.release_notes or "",
+            ] + zip_paths
+
+        subprocess.run(cmd, check=True)
+        print(f"  ✓ Published {len(zips)} assets to {self.release_repo}@{self.tag}")
+
     def run(self):
         """Run the complete build process."""
         print(f"Building swift-syntax {self.tag}")
         print(f"Platforms: {', '.join(self.platforms)}")
         print(f"Mode: {self.mode}")
         print(f"Output: {self.output_file}")
+        if self.publish:
+            print(f"Publish: {self.release_repo}")
         print()
 
         self.clone_repo()
@@ -551,6 +677,7 @@ class SwiftSyntaxBuilder:
         self.compute_checksums()
         self.create_sources_directory()
         self.generate_package_swift()
+        self.publish_release()
 
         print()
         print("=" * 60)
@@ -568,7 +695,8 @@ def main():
 Examples:
     %(prog)s --tag 601.0.1 --platforms macOS
     %(prog)s --tag 601.0.1 --platforms macOS,iOS,iOS_Simulator
-    %(prog)s --tag 601.0.1 --mode remote --base-url "https://example.com/frameworks"
+    %(prog)s --tag 603.0.1 --all-platforms
+    %(prog)s --tag 603.0.1 --mode remote --base-url "https://example.com/frameworks"
         """
     )
 
@@ -585,7 +713,15 @@ Examples:
     parser.add_argument(
         "--platforms",
         default="macOS",
-        help="Platforms to build, comma-separated (default: %(default)s)"
+        help=(
+            "Platforms to build, comma-separated (default: %(default)s). "
+            "Valid: " + ", ".join(SwiftSyntaxBuilder.ALL_PLATFORMS)
+        )
+    )
+    parser.add_argument(
+        "--all-platforms",
+        action="store_true",
+        help="Build for every supported platform (overrides --platforms)"
     )
     parser.add_argument(
         "--mode",
@@ -608,15 +744,60 @@ Examples:
         default=4,
         help="Number of parallel builds (default: %(default)s)"
     )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Upload built xcframework zips to a GitHub Release (requires `gh` CLI)"
+    )
+    parser.add_argument(
+        "--release-repo",
+        help="Target repo for --publish in OWNER/REPO form (default: detect from current git origin)"
+    )
+    parser.add_argument(
+        "--release-title",
+        help="Release title for --publish (default: tag)"
+    )
+    parser.add_argument(
+        "--release-notes",
+        help="Release notes body for --publish (default: empty)"
+    )
 
     args = parser.parse_args()
+
+    # Resolve --release-repo from current git origin when --publish is set.
+    if args.publish and not args.release_repo:
+        try:
+            args.release_repo = subprocess.run(
+                ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+                capture_output=True, text=True, check=True
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            parser.error(
+                "--publish needs --release-repo OWNER/REPO "
+                "(could not detect via `gh repo view` from current directory)"
+            )
+
+    # When publishing in remote mode without an explicit base URL, default to
+    # the GitHub Release asset URL so generated Package.swift points at the
+    # uploaded assets.
+    if args.publish and args.mode == "remote" and not args.base_url:
+        args.base_url = f"https://github.com/{args.release_repo}/releases/download"
 
     # Validate arguments
     if args.mode == "remote" and not args.base_url:
         parser.error("--base-url is required when --mode is 'remote'")
 
     # Parse platforms
-    platforms = [p.strip() for p in args.platforms.split(",")]
+    if args.all_platforms:
+        platforms = list(SwiftSyntaxBuilder.ALL_PLATFORMS)
+    else:
+        platforms = [p.strip() for p in args.platforms.split(",")]
+        unknown = [p for p in platforms if p not in SwiftSyntaxBuilder.PLATFORM_BUILD_DIRS]
+        if unknown:
+            parser.error(
+                f"Unknown platform(s): {unknown}. "
+                f"Valid: {sorted(SwiftSyntaxBuilder.PLATFORM_BUILD_DIRS)}"
+            )
 
     # Create builder and run
     builder = SwiftSyntaxBuilder(
@@ -627,6 +808,10 @@ Examples:
         base_url=args.base_url,
         output_file=args.output,
         parallel_builds=args.parallel,
+        publish=args.publish,
+        release_repo=args.release_repo,
+        release_title=args.release_title,
+        release_notes=args.release_notes,
     )
 
     try:
