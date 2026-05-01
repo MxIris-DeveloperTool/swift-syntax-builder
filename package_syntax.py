@@ -22,14 +22,19 @@ Options:
                         (default: detect from current git origin)
     --release-title T   Release title for --publish (default: tag)
     --release-notes N   Release notes body for --publish
+    --publish-branch    Push Package.swift + Sources/ to a release branch
+                        (orphan branch, force-pushed)
+    --branch-name N     Branch name for --publish-branch (default: release/<tag>)
+    --branch-repo R     Target repo for --publish-branch (default: --release-repo
+                        if set, else detect from current git origin)
     --help              Show this help message
 
 Examples:
     python3 package_syntax.py --tag 601.0.1 --platforms macOS
     python3 package_syntax.py --tag 603.0.1 --all-platforms
     python3 package_syntax.py --tag 603.0.1 --mode remote --base-url "https://example.com/frameworks"
-    python3 package_syntax.py --tag 603.0.1 --all-platforms --publish --mode remote \\
-        --release-repo Mx-Iris/swift-syntax-binaries
+    python3 package_syntax.py --tag 603.0.1 --all-platforms --publish --publish-branch \\
+        --mode remote --release-repo MxIris-DeveloperTool/swift-syntax-builder
 """
 
 import argparse
@@ -38,6 +43,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -115,6 +121,9 @@ class SwiftSyntaxBuilder:
         release_repo: Optional[str] = None,
         release_title: Optional[str] = None,
         release_notes: Optional[str] = None,
+        publish_branch: bool = False,
+        branch_name: Optional[str] = None,
+        branch_repo: Optional[str] = None,
     ):
         self.repo = repo
         self.repo_name = os.path.basename(repo)
@@ -130,6 +139,9 @@ class SwiftSyntaxBuilder:
         self.release_repo = release_repo
         self.release_title = release_title
         self.release_notes = release_notes
+        self.publish_branch_flag = publish_branch
+        self.branch_name = branch_name or f"release/{tag}"
+        self.branch_repo = branch_repo
 
         self.dest = Path.cwd() / tag
         self.source = Path("/tmp") / self.repo_name
@@ -659,6 +671,79 @@ class SwiftSyntaxBuilder:
         subprocess.run(cmd, check=True)
         print(f"  ✓ Published {len(zips)} assets to {self.release_repo}@{self.tag}")
 
+    def publish_branch(self):
+        """Push generated Package.swift + Sources/ to a release branch.
+
+        Clones the target repo into a temporary directory, creates an orphan
+        branch (independent history), copies the package files in, then
+        force-pushes. Force-push makes re-runs idempotent — repeated builds
+        for the same tag overwrite the branch with fresh content.
+        """
+        if not self.publish_branch_flag:
+            return
+        if not self.branch_repo:
+            raise RuntimeError("publish_branch called without branch_repo set")
+
+        try:
+            subprocess.run(["gh", "auth", "status"], check=True, capture_output=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError("--publish-branch requires the GitHub CLI (`gh`) to be installed") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError("`gh auth status` failed; run `gh auth login` first") from exc
+
+        sources_dir = self.output_file.parent / "Sources"
+        if not self.output_file.exists():
+            raise RuntimeError(f"Package.swift not found at {self.output_file}; run generation first")
+        if not sources_dir.exists():
+            raise RuntimeError(f"Sources/ not found at {sources_dir}; run generation first")
+
+        print(f"\nPublishing branch {self.branch_name} to {self.branch_repo}...")
+
+        tmp_clone = Path(tempfile.mkdtemp(prefix='swift-syntax-pkg-branch-'))
+        try:
+            subprocess.run(
+                ["gh", "repo", "clone", self.branch_repo, str(tmp_clone)],
+                check=True
+            )
+
+            # Orphan branch — independent history. Existing remote branch is
+            # overwritten by the force-push below.
+            subprocess.run(
+                ["git", "-C", str(tmp_clone), "checkout", "--orphan", self.branch_name],
+                check=True
+            )
+
+            for item in tmp_clone.iterdir():
+                if item.name == '.git':
+                    continue
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+
+            shutil.copy2(self.output_file, tmp_clone / "Package.swift")
+            shutil.copytree(sources_dir, tmp_clone / "Sources")
+
+            subprocess.run(
+                ["git", "-C", str(tmp_clone), "add", "Package.swift", "Sources"],
+                check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(tmp_clone), "commit",
+                 "-m", f"Release swift-syntax {self.tag} binary package"],
+                check=True
+            )
+            # Push to a fully-qualified ref to avoid any tag/branch ambiguity
+            # (gh release create earlier may have produced a same-name tag).
+            subprocess.run(
+                ["git", "-C", str(tmp_clone), "push", "--force", "origin",
+                 f"HEAD:refs/heads/{self.branch_name}"],
+                check=True
+            )
+            print(f"  ✓ Pushed branch {self.branch_name} to {self.branch_repo}")
+        finally:
+            shutil.rmtree(tmp_clone, ignore_errors=True)
+
     def run(self):
         """Run the complete build process."""
         print(f"Building swift-syntax {self.tag}")
@@ -667,6 +752,8 @@ class SwiftSyntaxBuilder:
         print(f"Output: {self.output_file}")
         if self.publish:
             print(f"Publish: {self.release_repo}")
+        if self.publish_branch_flag:
+            print(f"Publish branch: {self.branch_repo} ({self.branch_name})")
         print()
 
         self.clone_repo()
@@ -678,6 +765,7 @@ class SwiftSyntaxBuilder:
         self.create_sources_directory()
         self.generate_package_swift()
         self.publish_release()
+        self.publish_branch()
 
         print()
         print("=" * 60)
@@ -761,19 +849,57 @@ Examples:
         "--release-notes",
         help="Release notes body for --publish (default: empty)"
     )
+    parser.add_argument(
+        "--publish-branch",
+        action="store_true",
+        help=(
+            "Push generated Package.swift + Sources/ to a release branch on "
+            "the target repo (orphan branch, force-pushed; idempotent across re-runs)"
+        )
+    )
+    parser.add_argument(
+        "--branch-name",
+        help="Branch name for --publish-branch (default: release/<tag>)"
+    )
+    parser.add_argument(
+        "--branch-repo",
+        help=(
+            "Target repo for --publish-branch in OWNER/REPO form "
+            "(default: --release-repo if set, else detected from current git origin)"
+        )
+    )
 
     args = parser.parse_args()
 
-    # Resolve --release-repo from current git origin when --publish is set.
-    if args.publish and not args.release_repo:
+    # When --publish or --publish-branch is set without an explicit repo, try
+    # to detect the target repo from the current directory's git origin.
+    needs_detection = (
+        (args.publish and not args.release_repo)
+        or (args.publish_branch and not args.branch_repo and not args.release_repo)
+    )
+    detected_repo: Optional[str] = None
+    if needs_detection:
         try:
-            args.release_repo = subprocess.run(
+            detected_repo = subprocess.run(
                 ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
                 capture_output=True, text=True, check=True
             ).stdout.strip()
         except (subprocess.CalledProcessError, FileNotFoundError):
+            detected_repo = None
+
+    if args.publish and not args.release_repo:
+        if not detected_repo:
             parser.error(
                 "--publish needs --release-repo OWNER/REPO "
+                "(could not detect via `gh repo view` from current directory)"
+            )
+        args.release_repo = detected_repo
+
+    if args.publish_branch and not args.branch_repo:
+        args.branch_repo = args.release_repo or detected_repo
+        if not args.branch_repo:
+            parser.error(
+                "--publish-branch needs --branch-repo OWNER/REPO "
                 "(could not detect via `gh repo view` from current directory)"
             )
 
@@ -812,6 +938,9 @@ Examples:
         release_repo=args.release_repo,
         release_title=args.release_title,
         release_notes=args.release_notes,
+        publish_branch=args.publish_branch,
+        branch_name=args.branch_name,
+        branch_repo=args.branch_repo,
     )
 
     try:
