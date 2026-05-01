@@ -94,6 +94,7 @@ class SwiftSyntaxBuilder:
     # `platform.replace('_', ' ')` (e.g. "iOS_Simulator" -> "iOS Simulator").
     PLATFORM_BUILD_DIRS: Dict[str, Tuple[str, str]] = {
         "macOS": ("build.macOS", "Release"),
+        "macCatalyst": ("build.macCatalyst", "Release-maccatalyst"),
         "iOS": ("build.iOS", "Release-iphoneos"),
         "iOS_Simulator": ("build.iOS_Simulator", "Release-iphonesimulator"),
         "tvOS": ("build.tvOS", "Release-appletvos"),
@@ -102,6 +103,13 @@ class SwiftSyntaxBuilder:
         "watchOS_Simulator": ("build.watchOS_Simulator", "Release-watchsimulator"),
         "visionOS": ("build.visionOS", "Release-xros"),
         "visionOS_Simulator": ("build.visionOS_Simulator", "Release-xrsimulator"),
+    }
+
+    # Platforms whose xcodebuild destination string isn't the default
+    # "generic/platform=<name>" form. Mac Catalyst is built by selecting the
+    # macOS platform with a `Mac Catalyst` variant.
+    _DESTINATION_OVERRIDES: Dict[str, str] = {
+        "macCatalyst": "generic/platform=macOS,variant=Mac Catalyst",
     }
 
     ALL_PLATFORMS: List[str] = list(PLATFORM_BUILD_DIRS.keys())
@@ -292,14 +300,16 @@ class SwiftSyntaxBuilder:
     def build_module_for_platform(self, module: str, platform: str) -> bool:
         """Build a single module for a single platform."""
         ddata = self.source / f"build.{platform}"
-        dest_platform = platform.replace('_', ' ')
+        destination = self._DESTINATION_OVERRIDES.get(
+            platform, f"generic/platform={platform.replace('_', ' ')}"
+        )
 
         xcodebuild_cmd = [
             f"{self.xcoded}/usr/bin/xcodebuild",
             "-scheme", module,
             "-quiet",
             "-configuration", self.config,
-            "-destination", f"generic/platform={dest_platform}",
+            "-destination", destination,
             "-archivePath", str(self.source / "archives" / f"{module}-{platform}.xcarchive"),
             "-derivedDataPath", str(ddata),
             "SKIP_INSTALL=NO",
@@ -311,6 +321,14 @@ class SwiftSyntaxBuilder:
 
         if platform == "macOS":
             xcodebuild_cmd.append("ARCHS=arm64 arm64e x86_64")
+        elif platform == "macCatalyst":
+            # Mac Catalyst doesn't support arm64e. Forcing the variant avoids
+            # a "Designed for iPad" build slipping through.
+            xcodebuild_cmd += [
+                "ARCHS=arm64 x86_64",
+                "SUPPORTS_MACCATALYST=YES",
+                "SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD=NO",
+            ]
 
         try:
             subprocess.run(xcodebuild_cmd, cwd=self.source, check=True, capture_output=True)
@@ -398,6 +416,11 @@ class SwiftSyntaxBuilder:
     def _variant_to_platform(variant_name: str) -> Optional[str]:
         """Map an xcframework variant directory name (e.g. ios-arm64-simulator)
         back to the internal platform name used by PLATFORM_BUILD_DIRS."""
+        # Mac Catalyst variants are named e.g. `ios-arm64_x86_64-maccatalyst`,
+        # so we have to check this suffix BEFORE the `ios-` prefix below.
+        if "-maccatalyst" in variant_name:
+            return "macCatalyst"
+
         is_simulator = "simulator" in variant_name
         prefix_map = {
             "macos-": "macOS",
