@@ -27,6 +27,15 @@ Options:
     --branch-name N     Branch name for --publish-branch (default: release/<tag>)
     --branch-repo R     Target repo for --publish-branch (default: --release-repo
                         if set, else detect from current git origin)
+    --lower-platforms   Lower deployment targets to macOS 10.13 / iOS 12 /
+                        tvOS 12 / watchOS 4 (macCatalyst 13). Patches upstream
+                        sources to compile under the lower minimums. Off by
+                        default — upstream macOS 10.15 / iOS 13 / tvOS 13 /
+                        watchOS 6 are kept and no swift-syntax files are touched.
+    --release-tag T     GitHub Release tag (default: --tag, or
+                        `<tag>-lower-platforms` when --lower-platforms is set).
+                        Lets one upstream version be published twice — once
+                        with original deployment targets, once with lowered.
     --help              Show this help message
 
 Examples:
@@ -35,6 +44,7 @@ Examples:
     python3 package_syntax.py --tag 603.0.1 --mode remote --base-url "https://example.com/frameworks"
     python3 package_syntax.py --tag 603.0.1 --all-platforms --publish --publish-branch \\
         --mode remote --release-repo MxIris-DeveloperTool/swift-syntax-builder
+    python3 package_syntax.py --tag 603.0.1 --all-platforms --lower-platforms
 """
 
 import argparse
@@ -132,6 +142,8 @@ class SwiftSyntaxBuilder:
         publish_branch: bool = False,
         branch_name: Optional[str] = None,
         branch_repo: Optional[str] = None,
+        lower_platforms: bool = False,
+        release_tag: Optional[str] = None,
     ):
         self.repo = repo
         self.repo_name = os.path.basename(repo)
@@ -148,8 +160,16 @@ class SwiftSyntaxBuilder:
         self.release_title = release_title
         self.release_notes = release_notes
         self.publish_branch_flag = publish_branch
-        self.branch_name = branch_name or f"release/{tag}"
         self.branch_repo = branch_repo
+        self.lower_platforms = lower_platforms
+        # `release_tag` is the tag used for the GitHub Release and the
+        # release-branch name; it can differ from the upstream build tag
+        # so a single upstream version can be published twice — once with
+        # the original deployment targets and once with lowered ones.
+        self.release_tag = release_tag or (
+            f"{tag}-lower-platforms" if lower_platforms else tag
+        )
+        self.branch_name = branch_name or f"release/{self.release_tag}"
 
         self.dest = Path.cwd() / tag
         self.source = Path("/tmp") / self.repo_name
@@ -237,6 +257,199 @@ class SwiftSyntaxBuilder:
         new_content = content[:end_of_line + 1] + additions + content[end_of_line + 1:]
         package_file.write_text(new_content)
         print(f"Patched Package.swift, exposed {len(targets_to_expose)} libraries: {targets_to_expose}")
+
+    # Upstream swift-syntax 603.0.1 deployment targets, kept in sync with
+    # the values declared in apple/swift-syntax's Package.swift. Used as
+    # the default when --lower-platforms is not passed.
+    UPSTREAM_PLATFORM_LINES: List[str] = [
+        ".macOS(.v10_15)",
+        ".iOS(.v13)",
+        ".tvOS(.v13)",
+        ".watchOS(.v6)",
+        ".macCatalyst(.v13)",
+    ]
+
+    # Lower-platform deployment targets used when --lower-platforms is set.
+    # macOS arm64 binaries still have a hard 11.0 floor at the Mach-O level,
+    # but x86_64 slices drop all the way to 10.13, so consumers can declare
+    # 10.13 deployment targets and pick the appropriate slice at runtime.
+    LOWERED_PLATFORM_LINES: List[str] = [
+        ".macOS(.v10_13)",
+        ".iOS(.v12)",
+        ".tvOS(.v12)",
+        ".watchOS(.v4)",
+        ".macCatalyst(.v13)",
+    ]
+
+    def lower_upstream_platforms(self):
+        """Rewrite upstream Package.swift `platforms` block to lower minimums.
+
+        swift-syntax declares macOS 10.15 / iOS 13 / tvOS 13 / watchOS 6 in
+        its Package.swift. Macros are compile-time consumed (never linked
+        into the final app binary), so the deployment target inherited by
+        consumers can be much lower. We rewrite the block to the lowest
+        SwiftPM tools-version-5.9 defaults that still compile.
+
+        Idempotent: bails out if the block is already at our targets.
+        """
+        package_file = self.source / "Package.swift"
+        content = package_file.read_text()
+
+        block_re = re.compile(r'platforms:\s*\[(.*?)\]', re.DOTALL)
+        match = block_re.search(content)
+        if not match:
+            print("  No platforms: block found in upstream Package.swift, skipping...")
+            return
+
+        existing_block = match.group(1)
+        if all(line in existing_block for line in self.LOWERED_PLATFORM_LINES):
+            print("Upstream Package.swift platforms already lowered, skipping...")
+            return
+
+        indent = "    "
+        new_block = "platforms: [\n" + "\n".join(
+            f"{indent}{line},"
+            for line in self.LOWERED_PLATFORM_LINES
+        ) + f"\n{indent[:-2]}]"
+        new_content = content[:match.start()] + new_block + content[match.end():]
+        package_file.write_text(new_content)
+        print(f"Lowered upstream platforms to: {', '.join(self.LOWERED_PLATFORM_LINES)}")
+
+    # Source-level compatibility patches required when the deployment target
+    # is lowered below macOS 10.15. Each entry: (relative path, old text,
+    # new text). Patches are applied in order; missing files / mismatched
+    # text are skipped with a warning so the script keeps working on tags
+    # where the upstream source has already moved on.
+    LOWER_PLATFORM_SOURCE_PATCHES: List[Tuple[str, str, str]] = [
+        (
+            "Sources/_SwiftSyntaxGenericTestSupport/AssertEqualWithDiff.swift",
+            "  let stringComparison: String\n"
+            "\n"
+            "  // Use `CollectionDifference` on supported platforms to get `diff`-like line-based output. On\n"
+            "  // older platforms, fall back to simple string comparison.\n"
+            "  let actualLines = actual.split(separator: \"\\n\", omittingEmptySubsequences: false)\n"
+            "  let expectedLines = expected.split(separator: \"\\n\", omittingEmptySubsequences: false)\n"
+            "\n"
+            "  let difference = actualLines.difference(from: expectedLines)\n"
+            "\n"
+            "  var result = \"\"\n"
+            "\n"
+            "  var insertions = [Int: Substring]()\n"
+            "  var removals = [Int: Substring]()\n"
+            "\n"
+            "  for change in difference {\n"
+            "    switch change {\n"
+            "    case .insert(let offset, let element, _):\n"
+            "      insertions[offset] = element\n"
+            "    case .remove(let offset, let element, _):\n"
+            "      removals[offset] = element\n"
+            "    }\n"
+            "  }\n"
+            "\n"
+            "  var expectedLine = 0\n"
+            "  var actualLine = 0\n"
+            "\n"
+            "  while expectedLine < expectedLines.count || actualLine < actualLines.count {\n"
+            "    if let removal = removals[expectedLine] {\n"
+            "      result += \"–\\(removal)\\n\"\n"
+            "      expectedLine += 1\n"
+            "    } else if let insertion = insertions[actualLine] {\n"
+            "      result += \"+\\(insertion)\\n\"\n"
+            "      actualLine += 1\n"
+            "    } else {\n"
+            "      result += \" \\(expectedLines[expectedLine])\\n\"\n"
+            "      expectedLine += 1\n"
+            "      actualLine += 1\n"
+            "    }\n"
+            "  }\n"
+            "\n"
+            "  stringComparison = result",
+            "  let stringComparison: String\n"
+            "\n"
+            "  // Use `CollectionDifference` on supported platforms to get `diff`-like line-based output. On\n"
+            "  // older platforms, fall back to simple string comparison.\n"
+            "  if #available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *) {\n"
+            "    let actualLines = actual.split(separator: \"\\n\", omittingEmptySubsequences: false)\n"
+            "    let expectedLines = expected.split(separator: \"\\n\", omittingEmptySubsequences: false)\n"
+            "\n"
+            "    let difference = actualLines.difference(from: expectedLines)\n"
+            "\n"
+            "    var result = \"\"\n"
+            "\n"
+            "    var insertions = [Int: Substring]()\n"
+            "    var removals = [Int: Substring]()\n"
+            "\n"
+            "    for change in difference {\n"
+            "      switch change {\n"
+            "      case .insert(let offset, let element, _):\n"
+            "        insertions[offset] = element\n"
+            "      case .remove(let offset, let element, _):\n"
+            "        removals[offset] = element\n"
+            "      }\n"
+            "    }\n"
+            "\n"
+            "    var expectedLine = 0\n"
+            "    var actualLine = 0\n"
+            "\n"
+            "    while expectedLine < expectedLines.count || actualLine < actualLines.count {\n"
+            "      if let removal = removals[expectedLine] {\n"
+            "        result += \"–\\(removal)\\n\"\n"
+            "        expectedLine += 1\n"
+            "      } else if let insertion = insertions[actualLine] {\n"
+            "        result += \"+\\(insertion)\\n\"\n"
+            "        actualLine += 1\n"
+            "      } else {\n"
+            "        result += \" \\(expectedLines[expectedLine])\\n\"\n"
+            "        expectedLine += 1\n"
+            "        actualLine += 1\n"
+            "      }\n"
+            "    }\n"
+            "\n"
+            "    stringComparison = result\n"
+            "  } else {\n"
+            "    stringComparison = \"\"\"\n"
+            "      Actual:\n"
+            "      \\(actual)\n"
+            "      Expected:\n"
+            "      \\(expected)\n"
+            "      \"\"\"\n"
+            "  }",
+        ),
+        (
+            "Sources/SwiftRefactor/PackageManifest/StringUtils.swift",
+            "    // Combine the characters as a string again and return it.\n"
+            "    // FIXME: We should only construct a new string if anything changed.\n"
+            "    // FIXME: There doesn't seem to be a way to create a string from an\n"
+            "    //        array of Unicode scalars; but there must be a better way.\n"
+            "    return String(decoding: mangledUnichars.flatMap { $0.utf8 }, as: UTF8.self)",
+            "    // Combine the characters as a string again and return it.\n"
+            "    // FIXME: We should only construct a new string if anything changed.\n"
+            "    return mangledUnichars.reduce(into: \"\") { $0.unicodeScalars.append($1) }",
+        ),
+    ]
+
+    def patch_upstream_source_compat(self):
+        """Apply source-level fixups so swift-syntax compiles below macOS 10.15.
+
+        603.0.1 has two call sites that use macOS 10.15-only Standard
+        Library APIs (`Collection.difference(from:)` and
+        `Unicode.Scalar.utf8`). Patches are idempotent: if the patched text
+        is already present, the entry is skipped.
+        """
+        for rel_path, old_text, new_text in self.LOWER_PLATFORM_SOURCE_PATCHES:
+            file_path = self.source / rel_path
+            if not file_path.exists():
+                print(f"  Skip patch {rel_path}: file not present (probably newer tag)")
+                continue
+            content = file_path.read_text()
+            if new_text in content:
+                print(f"  Skip patch {rel_path}: already patched")
+                continue
+            if old_text not in content:
+                print(f"  Warning: patch target not found in {rel_path}; upstream source may have changed")
+                continue
+            file_path.write_text(content.replace(old_text, new_text))
+            print(f"  Patched {rel_path} for lower deployment target")
 
     def extract_modules(self):
         """Extract module names from patched Package.swift."""
@@ -565,6 +778,10 @@ class SwiftSyntaxBuilder:
         """Generate Package.swift with _Aggregation pattern."""
         print(f"\nGenerating {self.output_file}...")
 
+        platform_lines = (
+            self.LOWERED_PLATFORM_LINES if self.lower_platforms
+            else self.UPSTREAM_PLATFORM_LINES
+        )
         lines = [
             "// swift-tools-version: 5.9",
             "",
@@ -575,11 +792,7 @@ class SwiftSyntaxBuilder:
             "let package = Package(",
             '    name: "swift-syntax",',
             "    platforms: [",
-            "        .iOS(.v13),",
-            "        .macCatalyst(.v13),",
-            "        .macOS(.v10_15),",
-            "        .tvOS(.v13),",
-            "        .watchOS(.v6),",
+            *(f"        {line}," for line in sorted(platform_lines)),
             "    ],",
             "    products: [",
         ]
@@ -628,7 +841,7 @@ class SwiftSyntaxBuilder:
             if self.mode == "local":
                 lines.append(f'        .binaryTarget(name: "{module}", path: tag + "/{module}.xcframework.zip"),')
             else:
-                url = f"{self.base_url}/{self.tag}/{module}.xcframework.zip"
+                url = f"{self.base_url}/{self.release_tag}/{module}.xcframework.zip"
                 lines.append("        .binaryTarget(")
                 lines.append(f'            name: "{module}",')
                 lines.append(f'            url: "{url}",')
@@ -647,8 +860,10 @@ class SwiftSyntaxBuilder:
     def publish_release(self):
         """Upload built xcframework zips to a GitHub Release via `gh`.
 
-        Creates the release at self.tag if missing; otherwise uploads with
-        --clobber to overwrite existing assets.
+        Creates the release at self.release_tag if missing; otherwise uploads
+        with --clobber to overwrite existing assets. self.release_tag may
+        differ from self.tag (e.g. `<tag>-lower-platforms`) so the same
+        upstream version can be published as multiple distinct releases.
         """
         if not self.publish:
             return
@@ -668,31 +883,31 @@ class SwiftSyntaxBuilder:
             print(f"  Warning: no xcframework zips found in {self.dest}, skipping publish")
             return
 
-        print(f"\nPublishing release {self.tag} to {self.release_repo} ({len(zips)} assets)...")
+        print(f"\nPublishing release {self.release_tag} to {self.release_repo} ({len(zips)} assets)...")
 
         view = subprocess.run(
-            ["gh", "release", "view", self.tag, "--repo", self.release_repo],
+            ["gh", "release", "view", self.release_tag, "--repo", self.release_repo],
             capture_output=True
         )
         zip_paths = [str(z) for z in zips]
 
         if view.returncode == 0:
-            print(f"  Release {self.tag} exists, uploading assets with --clobber")
+            print(f"  Release {self.release_tag} exists, uploading assets with --clobber")
             cmd = [
-                "gh", "release", "upload", self.tag,
+                "gh", "release", "upload", self.release_tag,
                 "--repo", self.release_repo, "--clobber",
             ] + zip_paths
         else:
-            print(f"  Creating release {self.tag}")
+            print(f"  Creating release {self.release_tag}")
             cmd = [
-                "gh", "release", "create", self.tag,
+                "gh", "release", "create", self.release_tag,
                 "--repo", self.release_repo,
-                "--title", self.release_title or self.tag,
+                "--title", self.release_title or self.release_tag,
                 "--notes", self.release_notes or "",
             ] + zip_paths
 
         subprocess.run(cmd, check=True)
-        print(f"  ✓ Published {len(zips)} assets to {self.release_repo}@{self.tag}")
+        print(f"  ✓ Published {len(zips)} assets to {self.release_repo}@{self.release_tag}")
 
     def publish_branch(self):
         """Push generated Package.swift + Sources/ to a release branch.
@@ -753,7 +968,7 @@ class SwiftSyntaxBuilder:
             )
             subprocess.run(
                 ["git", "-C", str(tmp_clone), "commit",
-                 "-m", f"Release swift-syntax {self.tag} binary package"],
+                 "-m", f"Release swift-syntax {self.release_tag} binary package"],
                 check=True
             )
             # Push to a fully-qualified ref to avoid any tag/branch ambiguity
@@ -773,6 +988,12 @@ class SwiftSyntaxBuilder:
         print(f"Platforms: {', '.join(self.platforms)}")
         print(f"Mode: {self.mode}")
         print(f"Output: {self.output_file}")
+        if self.lower_platforms:
+            print("Deployment targets: lowered (macOS 10.13 / iOS 12 / tvOS 12 / watchOS 4)")
+        else:
+            print("Deployment targets: upstream (macOS 10.15 / iOS 13 / tvOS 13 / watchOS 6)")
+        if self.release_tag != self.tag:
+            print(f"Release tag: {self.release_tag} (build tag: {self.tag})")
         if self.publish:
             print(f"Publish: {self.release_repo}")
         if self.publish_branch_flag:
@@ -781,6 +1002,9 @@ class SwiftSyntaxBuilder:
 
         self.clone_repo()
         self.patch_package_swift()
+        if self.lower_platforms:
+            self.lower_upstream_platforms()
+            self.patch_upstream_source_compat()
         self.extract_modules()
         self.parse_dependencies()
         self.build_all_modules()
@@ -891,6 +1115,30 @@ Examples:
             "(default: --release-repo if set, else detected from current git origin)"
         )
     )
+    parser.add_argument(
+        "--lower-platforms",
+        action="store_true",
+        help=(
+            "Lower upstream swift-syntax deployment targets to macOS 10.13 / "
+            "iOS 12 / tvOS 12 / watchOS 4 (macCatalyst stays at 13). Patches "
+            "upstream sources to compile under the lower minimums and emits a "
+            "matching `platforms` block in the generated Package.swift. "
+            "Off by default — upstream macOS 10.15 / iOS 13 / tvOS 13 / "
+            "watchOS 6 are kept and no swift-syntax files are touched. When "
+            "enabled, the default --release-tag and --branch-name gain a "
+            "`-lower-platforms` suffix so the new artefacts don't overwrite "
+            "the original release/branch."
+        )
+    )
+    parser.add_argument(
+        "--release-tag",
+        help=(
+            "GitHub Release tag used by --publish and as the default "
+            "--branch-name (default: --tag, or `<tag>-lower-platforms` when "
+            "--lower-platforms is set). Lets a single upstream version be "
+            "published as two distinct releases without overwriting each other."
+        )
+    )
 
     args = parser.parse_args()
 
@@ -964,6 +1212,8 @@ Examples:
         publish_branch=args.publish_branch,
         branch_name=args.branch_name,
         branch_repo=args.branch_repo,
+        lower_platforms=args.lower_platforms,
+        release_tag=args.release_tag,
     )
 
     try:
